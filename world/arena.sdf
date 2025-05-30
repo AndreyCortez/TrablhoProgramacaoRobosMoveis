@@ -126,7 +126,7 @@
 
       <link name="flag_link">
         <!-- Posição da base do objeto no mundo -->
-        <pose>1.8 0 -0.1 0 0 0</pose>
+        <pose>1.8 0 0.2 0 0 0</pose>
 
         <!-- Mastro (cilindro) -->
         <visual name="pole_visual">
@@ -148,7 +148,7 @@
           <pose>0.16 0 0.38 0 0 0</pose>
           <geometry>
             <box>
-              <size>0.3 0.3 0.2</size>
+              <size>0.3 0.01 0.2</size>
             </box>
           </geometry>
           <material>
@@ -159,10 +159,10 @@
 
         <!-- Colisão geral como uma caixa envolvendo tudo -->
         <collision name="flag_collision">
-          <pose>0.08 0 -0.2 0 0 0</pose>
+          <pose>0.08 0 0.2 0 0 0</pose>
           <geometry>
             <box>
-              <size>1 1 1</size>
+              <size>0.35 0.02 0.4</size>
             </box>
           </geometry>
         </collision>
