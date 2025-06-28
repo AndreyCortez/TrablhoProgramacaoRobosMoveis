@@ -21,9 +21,12 @@ class ControleRobo(Node):
         self.estado_atual = self.explorando 
         self.imagem = None 
 
+        # Variáveis de deteção da bandeira e do mastro
         self.flag_pixel_centroid: tuple[int, int] | None = None
+        self.flagpole_base_pixel_centroid: tuple[int, int] | None = None # Ponto da base do mastro na imagem
         self.flag_detected_in_current_image: bool = False
         
+        # Variáveis de estimação da posição da bandeira
         self.raw_estimated_flag_positions: list[Point] = [] 
         self.filtered_estimated_flag_world_position: Point | None = None 
         self.FLAG_ESTIMATION_HISTORY_SIZE = 5 
@@ -36,6 +39,11 @@ class ControleRobo(Node):
 
         self.flag_estimation_timer: rclpy.timer.Timer | None = None
         
+        # --- NOVO: Variáveis para travar a meta da bandeira ---
+        self.final_flag_goal_position: Point | None = None
+        self.flag_goal_locked: bool = False
+        
+        # Parâmetros da câmera e transformações do robô
         self.camera_hfov = 1.57; self.camera_image_width = 320; self.camera_image_height = 240
         self.camera_focal_length_x = (self.camera_image_width / 2.0) / np.tan(self.camera_hfov / 2.0)
         
@@ -52,14 +60,17 @@ class ControleRobo(Node):
         self.R_CF_B = self.R_CF_CL; self.P_CF_B = self.P_CL_B
         self.R_CF_L = self.R_L_B.inv() * self.R_CF_B
 
+        # Parâmetros e dados do LiDAR
         self.lidar_ranges: list[float] = []; self.lidar_angle_min: float = 0.0
         self.lidar_angle_increment: float = 0.0174532925199 
         self.lidar_range_min: float = 0.12; self.lidar_range_max: float = 3.5
         
+        # Posição e orientação do robô
         self.posicao_atual: Point | None = None; self.orientacao_quat_atual: Quaternion | None = None
         self.robot_x: float | None = None; self.robot_y: float | None = None; self.robot_yaw: float | None = None
 
-        self.map_resolution = 0.05; self.map_width_meters = 10.0; self.map_height_meters = 10.0
+        # Configurações do mapa de ocupação
+        self.map_resolution = 0.05; self.map_width_meters = 20.0; self.map_height_meters = 20.0
         self.map_num_cells_width = int(self.map_width_meters/self.map_resolution)
         self.map_num_cells_height = int(self.map_height_meters/self.map_resolution)
         self.map_origin_x = -self.map_width_meters/2.0; self.map_origin_y = -self.map_height_meters/2.0
@@ -68,14 +79,16 @@ class ControleRobo(Node):
         self.occupancy_map = np.full((self.map_num_cells_height, self.map_num_cells_width), self.FREE_CELL_VALUE, dtype=np.int8)
         self.map_display_window_width = 600; self.map_display_window_height = 600
         
+        # Variáveis de planejamento de caminho
         self.planned_path: list[tuple[int, int]] | None = None
         self.goal_for_current_path: Point | None = None 
         self.current_path_segment_index: int = 0
         self.WAYPOINT_REACHED_THRESHOLD_METERS = 0.3
-        self.SAFETY_RADIUS_METERS = 0.3 # Ajuste conforme necessário
+        self.SAFETY_RADIUS_METERS = 0.3 # Raio de segurança em metros
         self.safety_radius_cells = int(self.SAFETY_RADIUS_METERS / self.map_resolution)
         self._astar_open_set_counter = 0 # Para desempate no heapq A*
 
+        # Publishers, Subscribers e Timers
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         self.create_subscription(Imu, '/imu', self.imu_callback, 10)
@@ -93,18 +106,31 @@ class ControleRobo(Node):
     def mudar_estado(self, novo_estado):
         estado_anterior_nome = self.estado_atual.__name__ if self.estado_atual else "Nenhum"
         self.get_logger().info(f"Mudando estado de '{estado_anterior_nome}' para '{novo_estado.__name__}'")
+        
         if self.timer_estado is not None: self.timer_estado.destroy()
-        if estado_anterior_nome == "navegando_para_bandeira" and self.flag_estimation_timer:
-            self.flag_estimation_timer.destroy(); self.flag_estimation_timer = None
-            self.get_logger().info("Timer de estimação da bandeira parado.")
+
+        # Se está saindo dos estados de perseguição da bandeira, reseta a lógica de meta
+        if estado_anterior_nome in ["navegando_para_bandeira", "centralizando_para_medir"] and novo_estado == self.explorando:
+            self.get_logger().info("Resetando meta da bandeira ao voltar a explorar.")
+            self.final_flag_goal_position = None
+            self.flag_goal_locked = False
+            self.planned_path = None
+            self.raw_estimated_flag_positions = []
+            self.filtered_estimated_flag_world_position = None
+            # Para o timer de estimação se estiver ativo
+            if self.flag_estimation_timer:
+                self.flag_estimation_timer.destroy()
+                self.flag_estimation_timer = None
+
         self.estado_atual = novo_estado
         self.timer_estado = self.create_timer(0.1, self.run_current_state)
-        if self.estado_atual == self.navegando_para_bandeira:
+        
+        # Inicia o timer de estimação apenas quando entra no estado de navegação e não está travado
+        if self.estado_atual == self.navegando_para_bandeira and not self.flag_goal_locked:
             self.planned_path = None; self.current_path_segment_index = 0; self.goal_for_current_path = None
             if self.flag_estimation_timer is None:
-                self.get_logger().info("Iniciando estimação da bandeira ao entrar em NAVEGANDO_PARA_BANDEIRA.")
-                self.estimate_flag_position(); self.flag_estimation_timer = self.create_timer(1.0, self.estimate_flag_position)
-                self.get_logger().info("Timer de estimação da bandeira iniciado.")
+                self.get_logger().info("Iniciando timer de estimação (meta não travada).")
+                self.flag_estimation_timer = self.create_timer(1.0, self.estimate_flag_position)
     
     def world_to_map_coords(self, world_x: float, world_y: float) -> tuple[int | None, int | None]:
         if world_x is None or world_y is None: return None, None
@@ -148,30 +174,127 @@ class ControleRobo(Node):
     def camera_callback(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self.imagem = frame 
-            label_bandeira = 40 
-            target_color_bgr = np.array([label_bandeira, label_bandeira, label_bandeira])
-            min_area_necessaria = 30 
-            mask = cv2.inRange(self.imagem, target_color_bgr, target_color_bgr)
+            self.imagem = frame
+            
+            label_bandeira_bgr = np.array([25, 25, 25])
+            label_chao_bgr = np.array([15, 15, 15]) 
+            min_area_necessaria = 700 
+            
+            mask = cv2.inRange(self.imagem, label_bandeira_bgr, label_bandeira_bgr)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
             self.flag_detected_in_current_image = False 
-            largest_flag_contour = None; max_area = 0
+            self.flag_pixel_centroid = None
+            self.flagpole_base_pixel_centroid = None
+            largest_flag_contour = None
+            max_area = 0
+
             for contour in contours:
                 area = cv2.contourArea(contour)
                 if area > min_area_necessaria and area > max_area:
-                    max_area = area; largest_flag_contour = contour
+                    max_area = area
+                    largest_flag_contour = contour
+
             if largest_flag_contour is not None:
                 self.flag_detected_in_current_image = True
+                
                 M = cv2.moments(largest_flag_contour)
-                if M["m00"] != 0: self.flag_pixel_centroid = (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
-                else: self.flag_pixel_centroid = None; self.flag_detected_in_current_image = False 
-            else: self.flag_pixel_centroid = None; self.flag_detected_in_current_image = False
+                if M["m00"] != 0:
+                    self.flag_pixel_centroid = (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
+                else:
+                    self.flag_detected_in_current_image = False 
+
+                if self.flag_detected_in_current_image:
+                    idx_ponto_mais_baixo = largest_flag_contour[:, 0, 1].argmax()
+                    ponto_mais_baixo = largest_flag_contour[idx_ponto_mais_baixo][0]
+                    px_chao_y = ponto_mais_baixo[1] + 2
+                    px_chao_x = ponto_mais_baixo[0]
+                    if 0 <= px_chao_y < self.camera_image_height and 0 <= px_chao_x < self.camera_image_width:
+                        cor_pixel_abaixo = self.imagem[px_chao_y, px_chao_x]
+                        if np.array_equal(cor_pixel_abaixo, label_chao_bgr):
+                            self.flagpole_base_pixel_centroid = tuple(ponto_mais_baixo)
+            
+            vis_frame = frame.copy()
+            if self.flag_detected_in_current_image and largest_flag_contour is not None:
+                cv2.drawContours(vis_frame, [largest_flag_contour], -1, (0, 255, 0), 2)
+            if self.flag_pixel_centroid:
+                cv2.circle(vis_frame, self.flag_pixel_centroid, 7, (255, 100, 0), -1)
+                cv2.circle(vis_frame, self.flag_pixel_centroid, 7, (255,255,255), 1)
+            if self.flagpole_base_pixel_centroid:
+                cv2.circle(vis_frame, self.flagpole_base_pixel_centroid, 7, (0, 0, 255), -1)
+                cv2.circle(vis_frame, self.flagpole_base_pixel_centroid, 7, (255,255,255), 1)
+            cv2.imshow("Flag Detection Details", vis_frame)
+            cv2.waitKey(1)
+
         except CvBridgeError as e: self.get_logger().error(f"Erro no CvBridge: {e}")
 
+    def _update_filtered_position(self, new_estimate: Point):
+        """Helper para atualizar a posição filtrada da bandeira."""
+        self.raw_estimated_flag_positions.append(new_estimate)
+        if len(self.raw_estimated_flag_positions) > self.FLAG_ESTIMATION_HISTORY_SIZE:
+            self.raw_estimated_flag_positions.pop(0)
+
+        if self.raw_estimated_flag_positions:
+            num_est = len(self.raw_estimated_flag_positions)
+            effective_weights = self.flag_estimation_weights[-num_est:]
+            normalized_weights = effective_weights / np.sum(effective_weights)
+            
+            avg_x = sum(pos.x * w for pos, w in zip(self.raw_estimated_flag_positions, normalized_weights))
+            avg_y = sum(pos.y * w for pos, w in zip(self.raw_estimated_flag_positions, normalized_weights))
+            avg_z = sum(pos.z * w for pos, w in zip(self.raw_estimated_flag_positions, normalized_weights))
+            
+            self.filtered_estimated_flag_world_position = Point(x=avg_x, y=avg_y, z=avg_z)
+            self.get_logger().info(f"Pos. FILTRADA Bandeira (mundo): X={avg_x:.2f}, Y={avg_y:.2f}")
+
+    def estimate_flag_position_from_center_beam(self):
+        """Estima a posição da bandeira usando um pequeno cone de feixes centrais do LiDAR."""
+        if not self.lidar_ranges or self.robot_x is None or self.robot_y is None or self.robot_yaw is None or self.lidar_angle_increment == 0:
+            self.get_logger().warn("Dados insuficientes para estimação precisa pelo centro.")
+            return
+
+        try:
+            center_beam_index = int(round(-self.lidar_angle_min / self.lidar_angle_increment))
+            if not (0 <= center_beam_index < len(self.lidar_ranges)):
+                 self.get_logger().error(f"Índice do feixe central ({center_beam_index}) fora dos limites.")
+                 return
+        except (ValueError, ZeroDivisionError):
+            self.get_logger().error("Não foi possível calcular o índice do feixe central.")
+            return
+
+        cone_half_width_beams = 2
+        start_index = max(0, center_beam_index - cone_half_width_beams)
+        end_index = min(len(self.lidar_ranges) - 1, center_beam_index + cone_half_width_beams)
+
+        valid_distances_in_cone = []
+        for i in range(start_index, end_index + 1):
+            dist = self.lidar_ranges[i]
+            if np.isfinite(dist) and self.lidar_range_min < dist < self.lidar_range_max:
+                valid_distances_in_cone.append(dist)
+        
+        if not valid_distances_in_cone:
+            self.get_logger().warn("Nenhuma distância válida encontrada no cone central do LiDAR.")
+            return
+        
+        distance = min(valid_distances_in_cone)
+
+        self.get_logger().info(f"Medição precisa: Distância mais provável no cone frontal de {distance:.2f}m.")
+        
+        P_flag_L = np.array([distance, 0.0, 0.0])
+        P_flag_B = self.R_L_B.apply(P_flag_L) + self.P_L_B
+        flag_x_W = self.robot_x + (P_flag_B[0] * np.cos(self.robot_yaw) - P_flag_B[1] * np.sin(self.robot_yaw))
+        flag_y_W = self.robot_y + (P_flag_B[0] * np.sin(self.robot_yaw) + P_flag_B[1] * np.cos(self.robot_yaw))
+        flag_z_W = (self.posicao_atual.z if self.posicao_atual else 0.0) + P_flag_B[2]
+        
+        current_precise_estimate = Point(x=flag_x_W, y=flag_y_W, z=flag_z_W)
+        self._update_filtered_position(current_precise_estimate)
+
     def estimate_flag_position(self):
-        if not self.flag_detected_in_current_image or self.flag_pixel_centroid is None: return
+        """Estima a posição da bandeira cruzando o ângulo da câmera com a distância do LiDAR."""
+        target_pixel = self.flagpole_base_pixel_centroid or self.flag_pixel_centroid
+        if not self.flag_detected_in_current_image or target_pixel is None: return
         if not self.lidar_ranges or self.robot_x is None or self.robot_yaw is None or self.lidar_angle_increment == 0: return
-        px, _ = self.flag_pixel_centroid
+        
+        px, _ = target_pixel
         pixel_offset_x = px - (self.camera_image_width / 2.0)
         theta_cam_x_rad = np.arctan2(pixel_offset_x, self.camera_focal_length_x)
         V_cf = np.array([np.sin(theta_cam_x_rad), 0.0, np.cos(theta_cam_x_rad)])
@@ -194,23 +317,7 @@ class ControleRobo(Node):
         flag_y_W = self.robot_y + (P_flag_B[0]*np.sin(self.robot_yaw) + P_flag_B[1]*np.cos(self.robot_yaw))
         flag_z_W = (self.posicao_atual.z if self.posicao_atual and self.posicao_atual.z is not None else 0.0) + P_flag_B[2]
         current_raw_estimate = Point(x=flag_x_W, y=flag_y_W, z=flag_z_W)
-        self.raw_estimated_flag_positions.append(current_raw_estimate)
-        if len(self.raw_estimated_flag_positions) > self.FLAG_ESTIMATION_HISTORY_SIZE: self.raw_estimated_flag_positions.pop(0)
-        if self.raw_estimated_flag_positions:
-            sum_w_x, sum_w_y, sum_w_z = 0.0, 0.0, 0.0; total_w_applied = 0.0
-            num_est = len(self.raw_estimated_flag_positions)
-            effective_weights = self.flag_estimation_weights[:num_est] if num_est <= len(self.flag_estimation_weights) else self.flag_estimation_weights
-            current_total_weight_sum = np.sum(effective_weights)
-            normalized_current_weights = (effective_weights / current_total_weight_sum) if current_total_weight_sum > 1e-6 else (np.ones(num_est)/num_est if num_est > 0 else [])
-            for i, pos in enumerate(self.raw_estimated_flag_positions):
-                weight = normalized_current_weights[i] if i < len(normalized_current_weights) else (1.0/num_est if num_est > 0 else 0)
-                sum_w_x += pos.x * weight; sum_w_y += pos.y * weight; sum_w_z += pos.z * weight
-                total_w_applied += weight
-            if total_w_applied > 1e-6 : 
-                 avg_x = sum_w_x / total_w_applied; avg_y = sum_w_y / total_w_applied; avg_z = sum_w_z / total_w_applied
-                 self.filtered_estimated_flag_world_position = Point(x=avg_x, y=avg_y, z=avg_z)
-                 self.get_logger().info(f"Pos. FILTRADA Bandeira (mundo): X={avg_x:.2f}, Y={avg_y:.2f}")
-            elif self.raw_estimated_flag_positions: self.filtered_estimated_flag_world_position = self.raw_estimated_flag_positions[-1]
+        self._update_filtered_position(current_raw_estimate)
 
     def create_inflated_map(self) -> np.ndarray:
         binary_obstacle_map = (self.occupancy_map >= self.PLANNING_OBSTACLE_THRESHOLD).astype(np.uint8)
@@ -229,7 +336,6 @@ class ControleRobo(Node):
     def _reconstruct_astar_path(self, came_from_map: dict, current_target_node: tuple[int,int], start_node: tuple[int,int]) -> list:
         path = [current_target_node]
         node = current_target_node
-        # Limita o número de iterações para evitar loops infinitos em casos anormais
         max_path_len = self.map_num_cells_width * self.map_num_cells_height 
         count = 0
         while node in came_from_map and count < max_path_len :
@@ -237,9 +343,9 @@ class ControleRobo(Node):
             path.append(node)
             if node == start_node: break
             count +=1
-        if path[-1] != start_node : # Se o start_node não foi alcançado
-             if current_target_node == start_node and len(path) == 1: # Objetivo era o próprio início
-                 pass # Caminho de um ponto é válido
+        if path[-1] != start_node :
+             if current_target_node == start_node and len(path) == 1:
+                 pass
              else:
                 self.get_logger().error(f"A* Reconstrução: Início {start_node} não encontrado no caminho para {current_target_node}.")
                 return [] 
@@ -247,34 +353,29 @@ class ControleRobo(Node):
 
 
     def is_line_collision_free(self, s_coords: tuple[int,int], e_coords: tuple[int,int], i_map: np.ndarray) -> bool:
-        # Retorna True se a linha entre s_coords e e_coords não colide com obstáculos em i_map
-        # (i_map é o mapa inflado onde 1 significa obstáculo/muito próximo)
         for c, r in self.get_line_cells(s_coords[0], s_coords[1], e_coords[0], e_coords[1]):
-            if not self.is_valid_map_coords(c,r) or i_map[r,c] == 1: # Obstáculo = 1 no mapa inflado
-                return False # Colisão detectada
-        return True # Sem colisão
+            if not self.is_valid_map_coords(c,r) or i_map[r,c] == 1:
+                return False
+        return True
 
     def smooth_path(self, path: list[tuple[int,int]], i_map: np.ndarray) -> list[tuple[int,int]]:
-        # Algoritmo simples de suavização por "atalhos"
-        if not path or len(path) < 3: # Não precisa suavizar caminhos muito curtos
+        if not path or len(path) < 3:
             return path
         
-        smoothed_path = [path[0]] # Começa com o primeiro ponto do caminho original
-        i = 0 # Índice do último waypoint adicionado ao caminho suavizado (referente ao caminho original)
+        smoothed_path = [path[0]]
+        i = 0
         
         while i < len(path) - 1:
             current_waypoint_in_original_path = path[i]
-            best_j = i + 1 # Por padrão, o próximo waypoint é o adjacente no caminho original
+            best_j = i + 1
             
-            # Tenta encontrar o waypoint mais distante no caminho original (path[j_loop])
-            # para o qual uma linha reta a partir de current_waypoint_in_original_path é livre de colisões.
-            for j_loop in range(len(path) - 1, i + 1, -1): # Itera de trás para frente (do fim do caminho até i+2)
+            for j_loop in range(len(path) - 1, i + 1, -1):
                 if self.is_line_collision_free(current_waypoint_in_original_path, path[j_loop], i_map):
-                    best_j = j_loop # Encontrou um atalho válido para path[j_loop]
+                    best_j = j_loop
                     break 
             
-            smoothed_path.append(path[best_j]) # Adiciona o waypoint do atalho encontrado
-            i = best_j # Avança o índice 'i' para este waypoint no caminho original
+            smoothed_path.append(path[best_j])
+            i = best_j
             
         return smoothed_path
 
@@ -304,7 +405,7 @@ class ControleRobo(Node):
         heapq.heappush(open_set, (f_initial, self._astar_open_set_counter, start_map_coords))
         open_set_hash = {start_map_coords}
         
-        processed_nodes_for_fallback = {} # Armazena g_scores dos nós processados
+        processed_nodes_for_fallback = {}
 
         path_found_to_original_goal = False
         path_to_return = None
@@ -321,15 +422,13 @@ class ControleRobo(Node):
                 self.get_logger().info("A*: Caminho direto para o objetivo original encontrado.")
                 path_found_to_original_goal = True
                 path_to_return = self._reconstruct_astar_path(came_from, current_coords, start_map_coords)
-                # Se o objetivo original é um obstáculo, remove o último ponto.
                 if inflated_map[original_goal_map_coords[1], original_goal_map_coords[0]] == 1 and path_to_return and len(path_to_return) > 1:
                     self.get_logger().info("A*: Objetivo original é obstáculo, planejando para célula adjacente.")
                     path_to_return.pop()
-                if not path_to_return: # Se ficou vazio (ex: start=goal e goal é obstáculo)
+                if not path_to_return:
                     self.get_logger().warn("A*: Caminho para objetivo original ficou vazio após ajuste.")
-                    # Continua para fallback se path_to_return for None/vazio
                 else:
-                    break # Sai do loop while
+                    break
 
             for d_col, d_row in [(0,1), (1,0), (0,-1), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]:
                 neighbor_col, neighbor_row = current_col + d_col, current_row + d_row
@@ -354,19 +453,16 @@ class ControleRobo(Node):
                         heapq.heappush(open_set, (f_val, self._astar_open_set_counter, neighbor_coords))
                         open_set_hash.add(neighbor_coords)
         
-        if path_to_return and path_found_to_original_goal: # Se encontrou caminho para o objetivo original
+        if path_to_return and path_found_to_original_goal:
             self.get_logger().info(f"A*: Caminho final para objetivo original com {len(path_to_return)} pontos.")
             return path_to_return
 
-        # Fallback: Se não encontrou caminho para o objetivo original
         self.get_logger().warn(f"A*: Nenhum caminho direto para {original_goal_map_coords}. Tentando ponto mais próximo.")
         if not processed_nodes_for_fallback:
             self.get_logger().error("A*: Nenhum nó explorado para fallback.")
             return None
 
         closest_node = None; min_h = float('inf')
-        # Itera sobre os nós que foram completamente processados (saíram da open_set)
-        # Ou, melhor, sobre todos os nós que tiveram um g_score finito (todos alcançáveis)
         reachable_nodes_with_finite_g = {node: score for node, score in g_score.items() if score != float('inf')}
 
         if not reachable_nodes_with_finite_g:
@@ -378,8 +474,8 @@ class ControleRobo(Node):
             if h < min_h:
                 min_h = h
                 closest_node = node
-            elif h == min_h: # Desempate: prefere o nó com menor g_score (caminho mais curto até ele)
-                if current_g_score < g_score.get(closest_node, float('inf')): # closest_node já terá g_score finito
+            elif h == min_h:
+                if current_g_score < g_score.get(closest_node, float('inf')):
                     closest_node = node
         
         if closest_node is None:
@@ -387,7 +483,7 @@ class ControleRobo(Node):
             return None
         if closest_node == start_map_coords and start_map_coords != original_goal_map_coords:
              self.get_logger().warn(f"A*: Ponto mais próximo {closest_node} é o início. Objetivo {original_goal_map_coords} inacessível.")
-             return None # Indica que não pode se mover em direção ao objetivo
+             return None
 
         self.get_logger().info(f"A*: Redirecionando para o ponto alcançável mais próximo: {closest_node}")
         path_to_closest = self._reconstruct_astar_path(came_from, closest_node, start_map_coords)
@@ -406,27 +502,24 @@ class ControleRobo(Node):
         
         self.planned_path = self.plan_path_astar((start_map_col, start_map_row), (goal_map_col, goal_map_row))
         
-        if self.planned_path and len(self.planned_path) > 0: # Verifica se o caminho não é vazio
+        if self.planned_path and len(self.planned_path) > 0:
             inflated_map_for_smoothing = self.create_inflated_map()
             self.planned_path = self.smooth_path(self.planned_path, inflated_map_for_smoothing)
             self.get_logger().info(f"Caminho planejado e suavizado com {len(self.planned_path)} pontos.")
             self.current_path_segment_index = 0 
-            # Atualiza goal_for_current_path para o último ponto do caminho planejado (que pode ser o adjacente)
-            # Isso é importante para a lógica de replanejamento em navegando_para_bandeira
+            
             final_goal_map_coords = self.planned_path[-1]
             wx, wy = self.map_to_world_coords(final_goal_map_coords[0], final_goal_map_coords[1])
-            # Se o objetivo original era a bandeira, mantém a referência à estimativa filtrada
-            # para que o replanejamento use sempre a estimativa mais recente da bandeira.
-            # Se o objetivo era um ponto genérico, usa o ponto final do caminho.
-            if self.estado_atual == self.navegando_para_bandeira and self.filtered_estimated_flag_world_position:
-                 self.goal_for_current_path = Point(x=self.filtered_estimated_flag_world_position.x,
-                                                    y=self.filtered_estimated_flag_world_position.y,
-                                                    z=self.filtered_estimated_flag_world_position.z) # O objetivo é a bandeira estimada
+            
+            if self.flag_goal_locked:
+                 self.goal_for_current_path = self.final_flag_goal_position
+            elif self.filtered_estimated_flag_world_position:
+                 self.goal_for_current_path = self.filtered_estimated_flag_world_position
             else:
-                 self.goal_for_current_path = Point(x=wx, y=wy, z=0.0) # Objetivo é o fim do caminho
+                 self.goal_for_current_path = Point(x=wx, y=wy, z=0.0)
         else: 
             self.get_logger().warn("Falha ao planejar caminho ou caminho vazio.")
-            self.planned_path = None # Garante que está None
+            self.planned_path = None
             self.goal_for_current_path = None
 
 
@@ -509,10 +602,15 @@ class ControleRobo(Node):
 
 
     def explorando(self):
-        if self.flag_detected_in_current_image and self.flag_pixel_centroid:
-            self.get_logger().info("Bandeira detectada em EXPLORANDO. Transicionando para NAVEGANDO_PARA_BANDEIRA.")
-            self.mudar_estado(self.navegando_para_bandeira)
-            return 
+        if self.flag_detected_in_current_image:
+            if self.flagpole_base_pixel_centroid:
+                self.get_logger().info("Bandeira e base do mastro detectados. Centralizando para medição precisa.")
+                self.mudar_estado(self.centralizando_para_medir)
+            else:
+                self.get_logger().info("Bandeira detectada (sem base). Transicionando para navegação geral.")
+                self.mudar_estado(self.navegando_para_bandeira)
+            return
+
         if not self.lidar_ranges: return
         distancias_frontais = []
         if len(self.lidar_ranges) > 0:
@@ -522,52 +620,119 @@ class ControleRobo(Node):
                 if -angulo_cone_frontal_rad < angle < angulo_cone_frontal_rad:
                     if np.isfinite(r) and self.lidar_range_min < r < self.lidar_range_max:
                         distancias_frontais.append(r)
-        obstaculo_a_frente = False; distancia_seguranca = 0.5
+        obstaculo_a_frente = False; distancia_seguranca = 0.7
         if distancias_frontais and min(distancias_frontais) < distancia_seguranca: obstaculo_a_frente = True
         twist = Twist()
         if not obstaculo_a_frente: twist.linear.x = 0.15; twist.angular.z = 0.0
         else: twist.linear.x = 0.0; twist.angular.z = -0.3
         self.cmd_vel_pub.publish(twist)
 
+    def centralizando_para_medir(self):
+        """Estado para girar o robô e alinhar a base do mastro com o centro da câmera."""
+        twist = Twist()
+        if not self.flagpole_base_pixel_centroid:
+            self.get_logger().warn("Perdeu a visão da base do mastro. Voltando a explorar.")
+            self.mudar_estado(self.explorando)
+            self.cmd_vel_pub.publish(twist)
+            return
+
+        camera_center_x = self.camera_image_width / 2.0
+        pixel_offset = self.flagpole_base_pixel_centroid[0] - camera_center_x
+        
+        centering_tolerance = 5.0
+
+        if abs(pixel_offset) > centering_tolerance:
+            K_angular_centering = 0.6
+            twist.angular.z = -K_angular_centering * (pixel_offset / camera_center_x)
+            twist.angular.z = np.clip(twist.angular.z, -0.4, 0.4)
+            twist.linear.x = 0.0
+            self.cmd_vel_pub.publish(twist)
+        else:
+            self.get_logger().info(f"Mastro centralizado (offset: {pixel_offset:.1f}px). Fazendo medição precisa.")
+            self.cmd_vel_pub.publish(twist)
+            
+            self.estimate_flag_position_from_center_beam()
+
+            # --- LÓGICA DE TRAVAMENTO DA META ---
+            if self.filtered_estimated_flag_world_position:
+                self.final_flag_goal_position = self.filtered_estimated_flag_world_position
+                self.flag_goal_locked = True
+                self.get_logger().info(f"META DA BANDEIRA TRAVADA EM: X={self.final_flag_goal_position.x:.2f}, Y={self.final_flag_goal_position.y:.2f}")
+
+            self.mudar_estado(self.navegando_para_bandeira)
+
     def navegando_para_bandeira(self): 
         log_prefix = "NAV_BANDEIRA: "
         twist = Twist() 
-        if not self.flag_detected_in_current_image and self.flag_pixel_centroid is None:
+
+        # Se perder a bandeira de vista, volta a explorar
+        if not self.flag_detected_in_current_image:
             self.get_logger().warn(f"{log_prefix}Bandeira perdida de vista! Voltando a explorar.")
-            self.mudar_estado(self.explorando); self.cmd_vel_pub.publish(twist); return
-        if self.filtered_estimated_flag_world_position is None:
-            self.get_logger().warn(f"{log_prefix}Posição da bandeira (filtrada) desconhecida. Aguardando estimativa.")
-            self.cmd_vel_pub.publish(twist); return
+            self.mudar_estado(self.explorando)
+            self.cmd_vel_pub.publish(twist)
+            return
+            
+        # Determina qual é o objetivo atual (travado ou flutuante)
+        current_goal = self.final_flag_goal_position if self.flag_goal_locked else self.filtered_estimated_flag_world_position
+
+        if current_goal is None:
+            self.get_logger().warn(f"{log_prefix}Nenhuma posição de objetivo (travada ou filtrada) disponível. Aguardando...")
+            self.cmd_vel_pub.publish(twist)
+            return
+
+        # Lógica de Planejamento/Re-planejamento
         needs_replan = False
-        if self.planned_path is None or not self.planned_path: needs_replan = True
-        elif self.goal_for_current_path is None: needs_replan = True
-        else: 
-            dist_sq = (self.filtered_estimated_flag_world_position.x - self.goal_for_current_path.x)**2 + \
-                      (self.filtered_estimated_flag_world_position.y - self.goal_for_current_path.y)**2
-            if dist_sq > (self.map_resolution * 3)**2: needs_replan = True
+        if self.planned_path is None:
+            needs_replan = True
+            self.get_logger().info(f"{log_prefix}Nenhum caminho existente. Planejando para o objetivo.")
+        # Só replaneja se a meta NÃO estiver travada e tiver se movido significativamente
+        elif not self.flag_goal_locked:
+            if self.goal_for_current_path:
+                dist_sq = (current_goal.x - self.goal_for_current_path.x)**2 + \
+                          (current_goal.y - self.goal_for_current_path.y)**2
+                # Limiar de replanejamento para evitar oscilações
+                replan_threshold_sq = (0.5)**2 # 50cm
+                if dist_sq > replan_threshold_sq:
+                    needs_replan = True
+                    self.get_logger().info(f"{log_prefix}Objetivo móvel mudou. Re-planejando.")
+            else:
+                needs_replan = True # Não deveria acontecer, mas por segurança
+
         if needs_replan:
-            self.get_logger().info(f"{log_prefix}Re-planejando para posição atualizada da bandeira.")
-            self.set_goal_and_plan_path_world_coords(
-                self.filtered_estimated_flag_world_position.x, self.filtered_estimated_flag_world_position.y)
+            self.set_goal_and_plan_path_world_coords(current_goal.x, current_goal.y)
+        
+        # Lógica de Seguimento de Caminho
         if self.planned_path and self.robot_x is not None and self.robot_yaw is not None:
             if self.current_path_segment_index >= len(self.planned_path):
-                self.get_logger().info(f"{log_prefix}Chegou ao final do caminho para a bandeira."); self.cmd_vel_pub.publish(twist); return
+                self.get_logger().info(f"{log_prefix}Chegou ao final do caminho para a bandeira."); 
+                # Adicionar lógica de captura aqui
+                self.mudar_estado(self.explorando) # Volta a explorar por enquanto
+                self.cmd_vel_pub.publish(twist); 
+                return
+
             target_map_col, target_map_row = self.planned_path[self.current_path_segment_index]
             target_world_x, target_world_y = self.map_to_world_coords(target_map_col, target_map_row)
             dx = target_world_x - self.robot_x; dy = target_world_y - self.robot_y
             distance_to_waypoint = np.sqrt(dx*dx + dy*dy)
+            
             if distance_to_waypoint < self.WAYPOINT_REACHED_THRESHOLD_METERS:
                 self.get_logger().info(f"{log_prefix}Waypoint {self.current_path_segment_index} alcançado.")
                 self.current_path_segment_index += 1
                 if self.current_path_segment_index >= len(self.planned_path): 
-                    self.get_logger().info(f"{log_prefix}Fim do caminho alcançado."); self.cmd_vel_pub.publish(twist); return
+                    self.get_logger().info(f"{log_prefix}Fim do caminho alcançado."); 
+                    self.mudar_estado(self.explorando) # Volta a explorar por enquanto
+                    self.cmd_vel_pub.publish(twist); 
+                    return
+                # Recalcula para o próximo waypoint
                 target_map_col, target_map_row = self.planned_path[self.current_path_segment_index]
                 target_world_x, target_world_y = self.map_to_world_coords(target_map_col, target_map_row)
                 dx = target_world_x - self.robot_x; dy = target_world_y - self.robot_y
+            
             angle_to_waypoint = np.arctan2(dy, dx)
             angle_diff = angle_to_waypoint - self.robot_yaw
             while angle_diff > np.pi: angle_diff -= 2*np.pi
             while angle_diff < -np.pi: angle_diff += 2*np.pi
+            
             K_angular = 0.7; K_linear_max = 0.15
             twist.angular.z = K_angular * angle_diff
             if abs(angle_diff) < np.deg2rad(30): 
@@ -576,7 +741,12 @@ class ControleRobo(Node):
             else: twist.linear.x = 0.0 
             twist.angular.z = np.clip(twist.angular.z, -0.5, 0.5)
             twist.linear.x = np.clip(twist.linear.x, 0.0, K_linear_max)
-        else: self.get_logger().info(f"{log_prefix}Sem caminho ou pose. Parando.")
+        else: 
+            self.get_logger().info(f"{log_prefix}Sem caminho ou pose. Parando.")
+            # Se o planejamento falhou (e.g. A* retornou None), o robô pararia aqui.
+            # E como não há mais replanejamento agressivo, ele não entra em loop.
+            # Ele aguardará até perder a bandeira de vista e voltar a explorar.
+        
         self.cmd_vel_pub.publish(twist)
 
     def posicionado_para_coleta(self): pass
@@ -598,3 +768,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    

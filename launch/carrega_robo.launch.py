@@ -35,6 +35,12 @@ def generate_launch_description():
     # ------------------------------------------------------
     # Publica as transformações dos links do robô com base no URDF.
     # Requer o parâmetro 'robot_description' com o conteúdo do modelo.
+    diff_drive_params = PathJoinSubstitution([
+        FindPackageShare("prm"),
+        "config",
+        "controller_config.yaml"
+    ])
+    
     robot_state_publisher_node = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
@@ -65,17 +71,21 @@ def generate_launch_description():
 
     # Inicialização do sistema de controle das rodas/motores do robo
     # o controle das rodas depende do estado das juntas
-    start_diff_controller = ExecuteProcess(
-        name="activate_diff_drive_base_controller",
-        cmd=[
-            "ros2",
-            "control",
-            "load_controller",
-            "--set-state",
-            "active",
-            "diff_drive_base_controller",
-        ],
-        shell=False,
+    start_diff_controller = Node(
+        package="controller_manager",
+        executable="spawner",
+        name="spawner_diff_drive_base_controller",
+        arguments=["diff_drive_base_controller"],
+        parameters=[diff_drive_params],
+        output="screen",
+    )
+
+    start_gripper_controller = Node(
+        package="controller_manager",
+        executable="spawner",
+        name="spawner_gripper_controller",
+        arguments=["gripper_controller"],
+        parameters=[diff_drive_params],
         output="screen",
     )
 
@@ -137,12 +147,13 @@ def generate_launch_description():
             "-name", "prm_robot",          # Nome da entidade no simulador
             "-topic", "robot_description", # Descrição do robô a ser utilizada
             "-z", "1.0",                   # Altura inicial do robô
-            "-x", "-2.0",                  # Posição no eixo X
+            "-x", "-8.0",                  # Posição no eixo X
+            "-y", "-0.5",                  # Posição no eixo X
             "--ros-args", "--log-level", "warn"
         ],
         parameters=[{"use_sim_time": True}],  # Usa o tempo simulado
     )
-
+    
     # ------------------------------------------------------
     # Ponte Gazebo <-> ROS 2 (ros_gz_bridge)
     # ------------------------------------------------------
@@ -174,6 +185,34 @@ def generate_launch_description():
         output="screen",
     )
 
+#  Nodo que publica odometria ground truth
+    odom_gt= Node(
+        package="prm",
+        executable="ground_truth_odometry",
+        name="odom_gt",
+        arguments="",
+        output="screen",
+    )
+
+#  Nodo que publica o mapa
+    robo_mapper= Node(
+        package="prm",
+        executable="robo_mapper",
+        name="robo_mapper",
+        arguments="",
+        output="screen",
+    )
+
+#  Casos vocês queiram carregar o controle do robô junto:
+#  Não esquecer de descomentar a linha no LaunchDescription
+#    controle= Node(
+#        package="prm",
+#        executable="controle_robo",
+#        name="controle_do_robo",
+#        arguments="",
+#        output="screen",
+#    )
+
     # ------------------------------------------------------
     # Definição da descrição completa do lançamento
     # ------------------------------------------------------
@@ -194,7 +233,16 @@ def generate_launch_description():
                 on_exit=[start_diff_controller], # Carrega o sistema de controle das rodas/motores
             )
         ),
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=start_diff_controller,
+                on_exit=[start_gripper_controller],
+            )
+        ),        
+        odom_gt,
+        robo_mapper,
         rviz_node,
-        relay_odom, # Nodos de redirecionamento de mensagens
-        relay_cmd_vel
+  #      relay_odom, # Nodos de redirecionamento de mensagens (Estamos usando apenas odom_gt agora)
+        relay_cmd_vel # Nodos de redirecionamento de mensagens
+  #      controle
     ])
