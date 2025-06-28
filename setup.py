@@ -59,7 +59,9 @@ setup(
     entry_points={
         'console_scripts': [
             'tartaruga = prm.controle_tartaruga:main',
-            'controle_robo = prm.controle_robo:main'
+            'ground_truth_odometry = prm.ground_truth_odometry:main',
+            'controle_robo = prm.controle_robo:main',
+            'robo_mapper = prm.robo_mapper:main'
         ],
     },
 )
